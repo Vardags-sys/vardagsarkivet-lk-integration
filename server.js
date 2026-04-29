@@ -2,9 +2,6 @@ import "dotenv/config";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import axios from "axios";
-import { wrapper } from "axios-cookiejar-support";
-import { CookieJar } from "tough-cookie";
-import https from "node:https";
 
 const app = Fastify({ logger: true });
 
@@ -24,6 +21,10 @@ const LK_THERMOSTAT_PATH =
   process.env.LK_THERMOSTAT_PATH || "/thermostat.json?tid={tid}";
 
 const LK_INSECURE_TLS = process.env.LK_INSECURE_TLS === "true";
+
+if (LK_INSECURE_TLS) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 
 if (!API_KEY) {
   throw new Error("Missing API_KEY environment variable");
@@ -53,38 +54,148 @@ app.addHook("onRequest", async (request, reply) => {
   }
 });
 
-function createLkClient() {
-  const jar = new CookieJar();
+class SimpleCookieJar {
+  constructor() {
+    this.cookies = new Map();
+  }
 
-  const httpsAgent = new https.Agent({
-    rejectUnauthorized: !LK_INSECURE_TLS,
-  });
+  addFromSetCookie(setCookieHeader) {
+    if (!setCookieHeader) return;
 
-  return wrapper(
-    axios.create({
-      baseURL: LK_BASE_URL,
-      jar,
-      withCredentials: true,
+    const cookies = Array.isArray(setCookieHeader)
+      ? setCookieHeader
+      : [setCookieHeader];
+
+    for (const cookieLine of cookies) {
+      if (!cookieLine || typeof cookieLine !== "string") continue;
+
+      const firstPart = cookieLine.split(";")[0];
+      const equalsIndex = firstPart.indexOf("=");
+
+      if (equalsIndex <= 0) continue;
+
+      const name = firstPart.slice(0, equalsIndex).trim();
+      const value = firstPart.slice(equalsIndex + 1).trim();
+
+      if (name) {
+        this.cookies.set(name, value);
+      }
+    }
+  }
+
+  getHeader() {
+    return [...this.cookies.entries()]
+      .map(([name, value]) => `${name}=${value}`)
+      .join("; ");
+  }
+
+  count() {
+    return this.cookies.size;
+  }
+
+  names() {
+    return [...this.cookies.keys()];
+  }
+}
+
+function makeUrl(pathOrUrl) {
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+    return pathOrUrl;
+  }
+
+  const base = LK_BASE_URL.replace(/\/+$/, "");
+  const path = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+
+  return `${base}${path}`;
+}
+
+async function lkRequest(jar, options) {
+  const {
+    method = "GET",
+    path,
+    data = undefined,
+    headers = {},
+    maxRedirects = 5,
+  } = options;
+
+  let currentMethod = method.toUpperCase();
+  let currentUrl = makeUrl(path);
+  let currentData = data;
+
+  for (let redirect = 0; redirect <= maxRedirects; redirect++) {
+    const cookieHeader = jar.getHeader();
+
+    const response = await axios({
+      method: currentMethod,
+      url: currentUrl,
+      data: currentData,
       timeout: 20000,
-      maxRedirects: 5,
-      httpsAgent,
-      validateStatus: (status) => status < 500,
+      maxRedirects: 0,
+      validateStatus: () => true,
       headers: {
-        "User-Agent": "Vardagsarkivet-LK-Integration/0.1",
+        "User-Agent": "Vardagsarkivet-LK-Integration/0.2",
         Accept: "application/json,text/html,*/*",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+        ...headers,
       },
-    })
-  );
+    });
+
+    jar.addFromSetCookie(response.headers["set-cookie"]);
+
+    if (
+      [301, 302, 303, 307, 308].includes(response.status) &&
+      response.headers.location &&
+      redirect < maxRedirects
+    ) {
+      const nextUrl = new URL(response.headers.location, currentUrl).toString();
+
+      currentUrl = nextUrl;
+
+      if (response.status === 303 || currentMethod === "POST") {
+        currentMethod = "GET";
+        currentData = undefined;
+      }
+
+      continue;
+    }
+
+    return response;
+  }
+
+  throw new Error("Too many redirects while calling LK");
+}
+
+function shortBody(data, limit = 1000) {
+  if (data === undefined || data === null) return null;
+
+  if (typeof data === "string") {
+    return data.slice(0, limit);
+  }
+
+  try {
+    return JSON.stringify(data).slice(0, limit);
+  } catch {
+    return String(data).slice(0, limit);
+  }
 }
 
 async function loginToLk() {
-  const client = createLkClient();
+  const jar = new SimpleCookieJar();
+
+  // First request establishes any anonymous/session cookies.
+  await lkRequest(jar, {
+    method: "GET",
+    path: "/",
+  });
 
   const form = new URLSearchParams();
   form.set(LK_USERNAME_FIELD, LK_EMAIL);
   form.set(LK_PASSWORD_FIELD, LK_PASSWORD);
 
-  const response = await client.post(LK_LOGIN_PATH, form.toString(), {
+  const response = await lkRequest(jar, {
+    method: "POST",
+    path: LK_LOGIN_PATH,
+    data: form.toString(),
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       Origin: LK_BASE_URL,
@@ -94,11 +205,16 @@ async function loginToLk() {
 
   if (response.status >= 400) {
     throw new Error(
-      `LK login failed. HTTP ${response.status}: ${String(response.data).slice(0, 500)}`
+      `LK login failed. HTTP ${response.status}: ${shortBody(response.data, 800)}`
     );
   }
 
-  return client;
+  return {
+    jar,
+    loginStatus: response.status,
+    loginContentType: response.headers["content-type"] || null,
+    loginSample: shortBody(response.data, 500),
+  };
 }
 
 function thermostatPath(tid) {
@@ -107,11 +223,11 @@ function thermostatPath(tid) {
 
 function toCelsius(value) {
   if (value === undefined || value === null || value === "") return null;
+
   const n = Number(value);
+
   if (Number.isNaN(n)) return null;
 
-  // LK community integrations often show temperatures as hundredths of degrees.
-  // Example: 2050 => 20.50 C.
   if (Math.abs(n) > 100) return n / 100;
 
   return n;
@@ -123,17 +239,24 @@ function normalizeThermostat(tid, raw) {
     toCelsius(raw.current_temp) ??
     toCelsius(raw.currentTemperature) ??
     toCelsius(raw.room_temp) ??
-    toCelsius(raw.temperature);
+    toCelsius(raw.temperature) ??
+    null;
 
   const setpoint =
     toCelsius(raw.set_room_deg) ??
     toCelsius(raw.setpoint) ??
     toCelsius(raw.target_temp) ??
-    toCelsius(raw.targetTemperature);
+    toCelsius(raw.targetTemperature) ??
+    null;
 
   return {
     tid,
-    name: raw.name ?? raw.room_name ?? raw.label ?? raw.description ?? `Thermostat ${tid}`,
+    name:
+      raw.name ??
+      raw.room_name ??
+      raw.label ??
+      raw.description ??
+      `Thermostat ${tid}`,
     currentTemperature,
     setpoint,
     battery: raw.battery !== undefined ? Number(raw.battery) : null,
@@ -152,29 +275,75 @@ app.get("/health", async () => {
   return {
     ok: true,
     service: "vardagsarkivet-lk-integration",
+    version: "0.2",
   };
 });
 
-app.get("/lk/test-login", async () => {
-  await loginToLk();
+app.get("/lk/debug-home", async () => {
+  const jar = new SimpleCookieJar();
+
+  const response = await lkRequest(jar, {
+    method: "GET",
+    path: "/",
+  });
 
   return {
     ok: true,
     baseUrl: LK_BASE_URL,
-    message: "Login request completed and session cookie jar was created.",
+    status: response.status,
+    contentType: response.headers["content-type"] || null,
+    cookies: {
+      count: jar.count(),
+      names: jar.names(),
+    },
+    sample: shortBody(response.data, 2000),
+  };
+});
+
+app.get("/lk/debug-login-config", async () => {
+  return {
+    ok: true,
+    baseUrl: LK_BASE_URL,
+    loginPath: LK_LOGIN_PATH,
+    usernameField: LK_USERNAME_FIELD,
+    passwordField: LK_PASSWORD_FIELD,
+    thermostatPath: LK_THERMOSTAT_PATH,
+    thermostatCount: LK_THERMOSTAT_COUNT,
+    insecureTls: LK_INSECURE_TLS,
+    emailConfigured: Boolean(LK_EMAIL),
+    passwordConfigured: Boolean(LK_PASSWORD),
+  };
+});
+
+app.get("/lk/test-login", async () => {
+  const result = await loginToLk();
+
+  return {
+    ok: true,
+    baseUrl: LK_BASE_URL,
+    loginStatus: result.loginStatus,
+    loginContentType: result.loginContentType,
+    cookies: {
+      count: result.jar.count(),
+      names: result.jar.names(),
+    },
+    message: "Login request completed.",
+    sample: result.loginSample,
   };
 });
 
 app.get("/lk/thermostats", async () => {
-  const client = await loginToLk();
+  const { jar } = await loginToLk();
 
   const thermostats = [];
   const errors = [];
 
   for (let tid = 1; tid <= LK_THERMOSTAT_COUNT; tid++) {
     try {
-      const path = thermostatPath(tid);
-      const response = await client.get(path);
+      const response = await lkRequest(jar, {
+        method: "GET",
+        path: thermostatPath(tid),
+      });
 
       if (response.status === 404) {
         continue;
@@ -184,7 +353,7 @@ app.get("/lk/thermostats", async () => {
         errors.push({
           tid,
           status: response.status,
-          error: String(response.data).slice(0, 500),
+          error: shortBody(response.data, 500),
         });
         continue;
       }
@@ -194,7 +363,7 @@ app.get("/lk/thermostats", async () => {
           tid,
           status: response.status,
           error: "Response was not JSON",
-          sample: String(response.data).slice(0, 500),
+          sample: shortBody(response.data, 500),
         });
         continue;
       }
@@ -226,15 +395,19 @@ app.get("/lk/thermostats/:tid", async (request, reply) => {
     });
   }
 
-  const client = await loginToLk();
-  const response = await client.get(thermostatPath(tid));
+  const { jar } = await loginToLk();
+
+  const response = await lkRequest(jar, {
+    method: "GET",
+    path: thermostatPath(tid),
+  });
 
   if (response.status >= 400) {
     return reply.code(response.status).send({
       ok: false,
       error: "lk_request_failed",
       status: response.status,
-      body: String(response.data).slice(0, 500),
+      body: shortBody(response.data, 500),
     });
   }
 
