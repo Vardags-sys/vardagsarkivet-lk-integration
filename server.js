@@ -18,6 +18,7 @@ const LK_PASSWORD_FIELD = process.env.LK_PASSWORD_FIELD || "password";
 
 const LK_INSECURE_TLS = process.env.LK_INSECURE_TLS === "true";
 const LK_LKID_COOKIE = process.env.LK_LKID_COOKIE || "";
+const LK_USER_COOKIE = process.env.LK_USER_COOKIE || "";
 
 if (LK_INSECURE_TLS) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -61,12 +62,10 @@ class SimpleCookieJar {
 
     let cleanValue = String(value).trim();
 
-    // If user pasted "lkid=...; something=...", extract only value.
     const pattern = new RegExp(`${name}=([^;]+)`);
     const match = cleanValue.match(pattern);
     if (match) cleanValue = match[1].trim();
 
-    // LK/Tornado cookies are quoted in the browser.
     if (
       ["lkid", "theemail", "user", "lasttab"].includes(name) &&
       !cleanValue.startsWith('"')
@@ -95,9 +94,7 @@ class SimpleCookieJar {
       const name = firstPart.slice(0, equalsIndex).trim();
       const value = firstPart.slice(equalsIndex + 1).trim();
 
-      if (name) {
-        this.cookies.set(name, value);
-      }
+      if (name) this.cookies.set(name, value);
     }
   }
 
@@ -188,9 +185,7 @@ async function lkRequest(jar, options) {
 function shortBody(data, limit = 1000) {
   if (data === undefined || data === null) return null;
 
-  if (typeof data === "string") {
-    return data.slice(0, limit);
-  }
+  if (typeof data === "string") return data.slice(0, limit);
 
   try {
     return JSON.stringify(data).slice(0, limit);
@@ -205,15 +200,25 @@ function createSeededJar() {
   jar.set("theemail", LK_EMAIL);
   jar.set("viewport", "796x1121x1.00");
 
-  if (LK_LKID_COOKIE) {
-    jar.set("lkid", LK_LKID_COOKIE);
-  }
+  if (LK_LKID_COOKIE) jar.set("lkid", LK_LKID_COOKIE);
+  if (LK_USER_COOKIE) jar.set("user", LK_USER_COOKIE);
 
   return jar;
 }
 
 async function loginToLk() {
   const jar = createSeededJar();
+
+  if (LK_USER_COOKIE && LK_LKID_COOKIE) {
+    return {
+      jar,
+      loginStatus: "cookie-session",
+      loginContentType: null,
+      loginResponse: {
+        msg: "Using pre-authenticated LK cookies from environment variables",
+      },
+    };
+  }
 
   await lkRequest(jar, {
     method: "GET",
@@ -263,23 +268,107 @@ function decodeHexLatin1(hex) {
   if (!hex || typeof hex !== "string") return "";
 
   try {
-    const bytes = hex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) || [];
-    return Buffer.from(bytes).toString("latin1");
+    return Buffer.from(hex, "hex").toString("latin1");
   } catch {
     return hex;
   }
+}
+
+function encodeHexLatin1(text) {
+  if (typeof text !== "string") throw new Error("name must be a string");
+  if (text.length > 15) throw new Error("name may not exceed 15 characters");
+
+  return Buffer.from(text, "latin1").toString("hex");
 }
 
 function toCelsius(value) {
   if (value === undefined || value === null || value === "") return null;
 
   const n = Number(value);
-
   if (Number.isNaN(n)) return null;
 
   if (Math.abs(n) > 100) return n / 100;
-
   return n;
+}
+
+function toLkTemp(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error("temperature must be numeric");
+
+  const raw = Math.abs(n) <= 100 ? Math.round(n * 100) : Math.round(n);
+
+  if (raw < 700 || raw > 4000) {
+    throw new Error("temperature must be between 7.0 and 40.0 °C");
+  }
+
+  return raw;
+}
+
+function toEnabled(value) {
+  if (value === true || value === 1 || value === "1" || value === "true" || value === "on") return "1";
+  if (value === false || value === 0 || value === "0" || value === "false" || value === "off") return "0";
+  throw new Error("enabled must be boolean");
+}
+
+function toMinutesFromMidnight(value) {
+  if (typeof value === "number") {
+    if (value < 0 || value > 1440) throw new Error("time minutes must be 0-1440");
+    return Math.round(value);
+  }
+
+  if (typeof value === "string" && /^\d{1,2}:\d{2}$/.test(value)) {
+    const [h, m] = value.split(":").map(Number);
+    const minutes = h * 60 + m;
+    if (minutes < 0 || minutes > 1440) throw new Error("time must be 00:00-24:00");
+    return minutes;
+  }
+
+  throw new Error("time must be minutes number or HH:mm string");
+}
+
+function normalizePercentToLk(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error("percent must be numeric");
+  if (n < 0 || n > 100) throw new Error("percent must be 0-100");
+  return Math.round(n * 100);
+}
+
+function validateTid(id) {
+  const tid = Number(id);
+  if (!Number.isInteger(tid) || tid < 1 || tid > 64) {
+    throw new Error("tid must be an integer between 1 and 64");
+  }
+  return tid;
+}
+
+async function lkUpdate(jar, params) {
+  const query = new URLSearchParams();
+
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) query.set(key, String(value));
+  }
+
+  query.set("_", String(Date.now()));
+
+  const response = await lkRequest(jar, {
+    method: "GET",
+    path: `/update.cgi?${query.toString()}`,
+    headers: {
+      Accept: "*/*",
+      Referer: `${LK_BASE_URL}/`,
+      "X-Requested-With": "XMLHttpRequest",
+    },
+  });
+
+  if (response.status >= 400) {
+    throw new Error(`LK update failed. HTTP ${response.status}: ${shortBody(response.data, 800)}`);
+  }
+
+  return {
+    status: response.status,
+    params,
+    response: response.data,
+  };
 }
 
 async function getMainJson() {
@@ -291,16 +380,12 @@ async function getMainJson() {
     headers: {
       Accept: "*/*",
       Referer: `${LK_BASE_URL}/`,
+      "X-Requested-With": "XMLHttpRequest",
     },
   });
 
   if (response.status >= 400) {
-    throw new Error(
-      `LK main.json failed. HTTP ${response.status}: ${shortBody(
-        response.data,
-        800
-      )}`
-    );
+    throw new Error(`LK main.json failed. HTTP ${response.status}: ${shortBody(response.data, 800)}`);
   }
 
   if (!response.data || typeof response.data !== "object") {
@@ -308,6 +393,7 @@ async function getMainJson() {
   }
 
   return {
+    jar,
     raw: response.data,
     loginResponse,
     cookies: {
@@ -317,12 +403,41 @@ async function getMainJson() {
   };
 }
 
+async function getThermostatJson(id) {
+  const tid = validateTid(id);
+  const { jar } = await loginToLk();
+
+  const response = await lkRequest(jar, {
+    method: "GET",
+    path: `/thermostat.json?tid=${tid}&_=${Date.now()}`,
+    headers: {
+      Accept: "*/*",
+      Referer: `${LK_BASE_URL}/thermostat.htm?tid=${tid}`,
+      "X-Requested-With": "XMLHttpRequest",
+    },
+  });
+
+  if (response.status >= 400) {
+    throw new Error(`LK thermostat.json failed. HTTP ${response.status}: ${shortBody(response.data, 800)}`);
+  }
+
+  if (!response.data || typeof response.data !== "object") {
+    throw new Error(`LK thermostat.json was not JSON: ${shortBody(response.data, 800)}`);
+  }
+
+  return {
+    jar,
+    raw: response.data,
+  };
+}
+
 function normalizeMainJson(raw) {
   const names = raw.name || [];
   const sectionNames = raw.sect_name || [];
   const active = raw.active || [];
   const getRoomDeg = raw.get_room_deg || [];
   const setRoomDeg = raw.set_room_deg || [];
+  const getFloorDeg = raw.get_floor_deg || [];
   const heatStatus = raw.heat_status || [];
   const zoneAlarms = raw.zone_alarms || [];
   const bypassStatus = raw.bypass_status || [];
@@ -331,14 +446,16 @@ function normalizeMainJson(raw) {
 
   for (let i = 0; i < names.length; i++) {
     const isActive = String(active[i] || "0") === "1";
-
     if (!isActive) continue;
 
-    const zone = {
+    zones.push({
       index: i,
       id: i + 1,
+      receiverId: Math.floor(i / 8) + 1,
+      receiverChannel: (i % 8) + 1,
       name: decodeHexLatin1(names[i]),
       currentTemperature: toCelsius(getRoomDeg[i]),
+      floorTemperature: toCelsius(getFloorDeg[i]),
       setpoint: toCelsius(setRoomDeg[i]),
       heating: String(heatStatus[i] || "0") === "1",
       alarm: String(zoneAlarms[i] || "0") !== "0",
@@ -347,33 +464,135 @@ function normalizeMainJson(raw) {
         name: names[i],
         active: active[i],
         get_room_deg: getRoomDeg[i],
+        get_floor_deg: getFloorDeg[i],
         set_room_deg: setRoomDeg[i],
         heat_status: heatStatus[i],
         zone_alarms: zoneAlarms[i],
         bypass_status: bypassStatus[i],
       },
-    };
-
-    zones.push(zone);
+    });
   }
 
   const sections = sectionNames.map((name, index) => ({
     index,
     id: index + 1,
     name: decodeHexLatin1(name),
+    softwareVersion: raw.sect_sw_version?.[index] ? Number(raw.sect_sw_version[index]) : null,
+    alarm: raw.sect_alarms?.[index] ? String(raw.sect_alarms[index]) !== "0" : false,
+    actuatorAlarm: raw.sect_actuator_alarms?.[index]
+      ? String(raw.sect_actuator_alarms[index]) !== "0"
+      : false,
   }));
 
   return {
+    system: {
+      override: Number(raw.override || 0),
+      wirelessId: raw.wireless_id ?? null,
+      modbusStatus: raw.modbus_status ?? null,
+    },
     sections,
     zones,
   };
+}
+
+function minutesToTime(minutes) {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function normalizeWeekProgram(rawWeekProgram = []) {
+  const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+  return days.map((dayName, day) => {
+    const events = [];
+
+    for (let event = 0; event < 3; event++) {
+      const index = day * 6 + event * 2;
+      const start = Number(rawWeekProgram[index]);
+      const end = Number(rawWeekProgram[index + 1]);
+
+      if (Number.isFinite(start) && Number.isFinite(end) && start !== end) {
+        events.push({
+          event: event + 1,
+          startMinutes: start,
+          endMinutes: end,
+          start: minutesToTime(start),
+          end: minutesToTime(end),
+        });
+      }
+    }
+
+    return {
+      day,
+      dayName,
+      events,
+    };
+  });
+}
+
+function normalizeThermostatDetails(raw) {
+  return {
+    id: Number(raw.tid),
+    name: decodeHexLatin1(raw.name),
+    active: String(raw.active || "0") === "1",
+    receiverId: raw.tid ? Math.floor((Number(raw.tid) - 1) / 8) + 1 : null,
+    receiverChannel: raw.ru_channel ? Number(raw.ru_channel) : null,
+    roomUnitType: raw.ru_type ? Number(raw.ru_type) : null,
+    battery: raw.battery !== undefined ? Number(raw.battery) : null,
+    linkQuality: raw.link_quality !== undefined ? Number(raw.link_quality) : null,
+    softwareVersion: raw.ru_sw_version !== undefined ? Number(raw.ru_sw_version) : null,
+    currentTemperature: toCelsius(raw.get_room_deg),
+    floorTemperature: toCelsius(raw.get_floor_deg),
+    setpoint: toCelsius(raw.set_room_deg),
+    comfortTemperature: toCelsius(raw.comfort_deg),
+    economyTemperature: toCelsius(raw.economy_deg),
+    holidayTemperature: toCelsius(raw.holiday_deg),
+    setbackTemperature: toCelsius(raw.setback_deg),
+    sensorModeMinTemperature: toCelsius(raw.sensor_mode_min_deg),
+    sensorModeMaxTemperature: toCelsius(raw.sensor_mode_max_deg),
+    restrictMinTemperature: toCelsius(raw.restrict_deg_min),
+    restrictMaxTemperature: toCelsius(raw.restrict_deg_max),
+    heating: String(raw.heat_status || "0") === "1",
+    zoneAlarm: String(raw.zone_alarms || "0") !== "0",
+    bypassStatus: String(raw.bypass_status || "0") !== "0",
+    weekProgramEnabled: String(raw.week_program_enable || "0") === "1",
+    weekProgramMode: raw.week_program_mode !== undefined ? Number(raw.week_program_mode) : null,
+    weekSetpoint: raw.week_setpoint !== undefined ? Number(raw.week_setpoint) : null,
+    operationMode: raw.operation_mode !== undefined ? Number(raw.operation_mode) : null,
+    adaptiveEnabled: String(raw.adaptive_enable || "0") === "1",
+    fireplaceHours: raw.fireplace_hours !== undefined ? Number(raw.fireplace_hours) : null,
+    fireplaceLevelPercent: raw.fireplace_level !== undefined ? Number(raw.fireplace_level) / 100 : null,
+    backlightEnabled: String(raw.backlight_enable || "0") === "1",
+    keylockEnabled: String(raw.keylock_enable || "0") === "1",
+    sensorMode: raw.sensor_mode !== undefined ? Number(raw.sensor_mode) : null,
+    bypassMode: raw.bypass_mode !== undefined ? Number(raw.bypass_mode) : null,
+    actuatorZone: raw.actuator_zone || [],
+    weekProgram: normalizeWeekProgram(raw.week_program || []),
+    raw,
+  };
+}
+
+function extractBody(request) {
+  return request.body && typeof request.body === "object" ? request.body : {};
+}
+
+async function doUpdateSequence(paramsList) {
+  const { jar } = await loginToLk();
+  const updates = [];
+
+  for (const params of paramsList) {
+    updates.push(await lkUpdate(jar, params));
+  }
+
+  return updates;
 }
 
 app.get("/health", async () => {
   return {
     ok: true,
     service: "vardagsarkivet-lk-integration",
-    version: "0.3-main-json",
+    version: "0.4-lk-read-write",
   };
 });
 
@@ -388,6 +607,7 @@ app.get("/lk/debug-login-config", async () => {
     emailConfigured: Boolean(LK_EMAIL),
     passwordConfigured: Boolean(LK_PASSWORD),
     lkidCookieConfigured: Boolean(LK_LKID_COOKIE),
+    userCookieConfigured: Boolean(LK_USER_COOKIE),
   };
 });
 
@@ -427,7 +647,6 @@ app.get("/lk/zones", async () => {
   };
 });
 
-// Backwards-compatible endpoint for Base44 dashboard.
 app.get("/lk/thermostats", async () => {
   const result = await getMainJson();
   const normalized = normalizeMainJson(result.raw);
@@ -437,22 +656,15 @@ app.get("/lk/thermostats", async () => {
     count: normalized.zones.length,
     thermostats: normalized.zones,
     sections: normalized.sections,
+    system: normalized.system,
   };
 });
 
 app.get("/lk/thermostats/:id", async (request, reply) => {
-  const id = Number(request.params.id);
-
-  if (!Number.isInteger(id) || id < 1) {
-    return reply.code(400).send({
-      ok: false,
-      error: "invalid_thermostat_id",
-    });
-  }
-
+  const id = validateTid(request.params.id);
   const result = await getMainJson();
   const normalized = normalizeMainJson(result.raw);
-  const thermostat = normalized.zones.find((z) => z.id === id || z.index === id);
+  const thermostat = normalized.zones.find((z) => z.id === id);
 
   if (!thermostat) {
     return reply.code(404).send({
@@ -467,13 +679,286 @@ app.get("/lk/thermostats/:id", async (request, reply) => {
   };
 });
 
-app.post("/lk/thermostats/:id/setpoint", async (request, reply) => {
-  return reply.code(501).send({
-    ok: false,
-    error: "setpoint_not_implemented_yet",
-    message:
-      "Read support is implemented through main.json. Capture the real LK write request when pressing plus/minus to implement setpoint changes.",
-  });
+app.get("/lk/thermostats/:id/details", async (request) => {
+  const result = await getThermostatJson(request.params.id);
+
+  return {
+    ok: true,
+    thermostat: normalizeThermostatDetails(result.raw),
+  };
+});
+
+app.post("/lk/thermostats/:id/setpoint", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+  const temperature = toLkTemp(body.temperature ?? body.setpoint);
+
+  const updates = await doUpdateSequence([
+    { tid, set_room_deg: temperature },
+    { tid, operation_mode: 1 },
+  ]);
+
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/comfort", async (request) => {
+  const tid = validateTid(request.params.id);
+  const temperature = toLkTemp(extractBody(request).temperature);
+  const updates = await doUpdateSequence([{ tid, comfort_deg: temperature }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/economy", async (request) => {
+  const tid = validateTid(request.params.id);
+  const temperature = toLkTemp(extractBody(request).temperature);
+  const updates = await doUpdateSequence([{ tid, economy_deg: temperature }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/holiday-temperature", async (request) => {
+  const tid = validateTid(request.params.id);
+  const temperature = toLkTemp(extractBody(request).temperature);
+  const updates = await doUpdateSequence([{ tid, holiday_deg: temperature }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/setback-temperature", async (request) => {
+  const tid = validateTid(request.params.id);
+  const temperature = toLkTemp(extractBody(request).temperature);
+  const updates = await doUpdateSequence([{ tid, setback_deg: temperature }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/name", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+  const name = body.name;
+  const updates = await doUpdateSequence([{ tid, setname: encodeHexLatin1(name) }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/sections/:id/name", async (request) => {
+  const cuid = Number(request.params.id);
+  if (!Number.isInteger(cuid) || cuid < 1 || cuid > 8) {
+    throw new Error("section id must be an integer between 1 and 8");
+  }
+
+  const body = extractBody(request);
+  const updates = await doUpdateSequence([{ cuid, setname: encodeHexLatin1(body.name) }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/weekly-program-mode", async (request) => {
+  const tid = validateTid(request.params.id);
+  const enabled = toEnabled(extractBody(request).enabled);
+
+  const updates = enabled === "1"
+    ? await doUpdateSequence([
+        { tid, week_program_enable: 1 },
+        { tid, operation_mode: 0 },
+        { tid, week_program_mode: 2 },
+      ])
+    : await doUpdateSequence([{ tid, week_program_enable: 0 }]);
+
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/week-program", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+  const day = Number(body.day);
+
+  if (!Number.isInteger(day) || day < 0 || day > 6) {
+    throw new Error("day must be an integer 0-6 where 0=Monday and 6=Sunday");
+  }
+
+  const events = Array.isArray(body.events) ? body.events.slice(0, 3) : [];
+  const updatesToSend = [];
+
+  for (let event = 0; event < 3; event++) {
+    const index = day * 6 + event * 2;
+    const item = events[event];
+
+    if (item) {
+      updatesToSend.push({
+        tid,
+        index,
+        week_program: toMinutesFromMidnight(item.start),
+      });
+      updatesToSend.push({
+        tid,
+        index: index + 1,
+        week_program: toMinutesFromMidnight(item.end),
+      });
+    } else {
+      updatesToSend.push({ tid, index, week_program: 720 });
+      updatesToSend.push({ tid, index: index + 1, week_program: 720 });
+    }
+  }
+
+  const updates = await doUpdateSequence(updatesToSend);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/adaptive", async (request) => {
+  const tid = validateTid(request.params.id);
+  const enabled = toEnabled(extractBody(request).enabled);
+  const updates = await doUpdateSequence([{ tid, adaptive_enable: enabled }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/fireplace", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+  const updatesToSend = [];
+
+  if (body.enabled !== undefined) {
+    const enabled = toEnabled(body.enabled);
+    updatesToSend.push({ tid, fireplace_hours: enabled === "1" ? Number(body.hours ?? 16) : 0 });
+  } else if (body.hours !== undefined) {
+    const hours = Number(body.hours);
+    if (!Number.isFinite(hours) || hours < 0 || hours > 100) {
+      throw new Error("fireplace hours must be 0-100");
+    }
+    updatesToSend.push({ tid, fireplace_hours: Math.round(hours) });
+  }
+
+  if (body.level !== undefined) {
+    updatesToSend.push({ tid, fireplace_level: normalizePercentToLk(body.level) });
+  }
+
+  if (updatesToSend.length === 0) {
+    throw new Error("provide enabled, hours, or level");
+  }
+
+  const updates = await doUpdateSequence(updatesToSend);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/backlight", async (request) => {
+  const tid = validateTid(request.params.id);
+  const enabled = toEnabled(extractBody(request).enabled);
+  const updates = await doUpdateSequence([{ tid, backlight_enable: enabled }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/keylock", async (request) => {
+  const tid = validateTid(request.params.id);
+  const enabled = toEnabled(extractBody(request).enabled);
+  const updates = await doUpdateSequence([{ tid, keylock_enable: enabled }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/sensor-mode", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+  const updatesToSend = [];
+
+  if (body.mode !== undefined) {
+    const mode = Number(body.mode);
+    if (![0, 1, 2, 3].includes(mode)) throw new Error("sensor mode must be 0, 1, 2, or 3");
+    updatesToSend.push({ tid, sensor_mode: mode });
+  }
+
+  if (body.minTemperature !== undefined) {
+    updatesToSend.push({ tid, sensor_mode_min_deg: toLkTemp(body.minTemperature) });
+  }
+
+  if (body.maxTemperature !== undefined) {
+    updatesToSend.push({ tid, sensor_mode_max_deg: toLkTemp(body.maxTemperature) });
+  }
+
+  if (updatesToSend.length === 0) throw new Error("provide mode, minTemperature, or maxTemperature");
+
+  const updates = await doUpdateSequence(updatesToSend);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/bypass-mode", async (request) => {
+  const tid = validateTid(request.params.id);
+  const mode = Number(extractBody(request).mode);
+  if (![0, 1, 2].includes(mode)) throw new Error("bypass mode must be 0, 1, or 2");
+  const updates = await doUpdateSequence([{ tid, bypass_mode: mode }]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/restrict-range", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+
+  const min = body.enabled === false ? 700 : toLkTemp(body.minTemperature ?? 7);
+  const max = body.enabled === false ? 4000 : toLkTemp(body.maxTemperature ?? 40);
+
+  const updates = await doUpdateSequence([
+    { tid, restrict_deg_min: min },
+    { tid, restrict_deg_max: max },
+  ]);
+
+  return { ok: true, updates };
+});
+
+app.post("/lk/thermostats/:id/update", async (request) => {
+  const tid = validateTid(request.params.id);
+  const body = extractBody(request);
+
+  const allowedRawFields = new Set([
+    "set_room_deg",
+    "operation_mode",
+    "comfort_deg",
+    "economy_deg",
+    "holiday_deg",
+    "setback_deg",
+    "week_program_enable",
+    "week_program_mode",
+    "adaptive_enable",
+    "fireplace_hours",
+    "fireplace_level",
+    "backlight_enable",
+    "keylock_enable",
+    "sensor_mode",
+    "sensor_mode_min_deg",
+    "sensor_mode_max_deg",
+    "bypass_mode",
+    "restrict_deg_min",
+    "restrict_deg_max",
+  ]);
+
+  const params = { tid };
+
+  for (const [key, value] of Object.entries(body)) {
+    if (!allowedRawFields.has(key)) continue;
+    params[key] = value;
+  }
+
+  if (Object.keys(params).length === 1) {
+    throw new Error("no allowed update fields supplied");
+  }
+
+  const updates = await doUpdateSequence([params]);
+  return { ok: true, updates };
+});
+
+app.post("/lk/system/holiday", async (request) => {
+  const body = extractBody(request);
+  const enabled = toEnabled(body.enabled);
+  const updatesToSend = [{ override_web: enabled === "1" ? 1 : 0 }];
+
+  if (enabled === "1" && body.days !== undefined) {
+    const days = Number(body.days);
+    if (!Number.isFinite(days) || days < 1 || days > 90) {
+      throw new Error("holiday days must be 1-90");
+    }
+    updatesToSend.push({ holiday_counter: Math.round(days * 24) });
+  }
+
+  const updates = await doUpdateSequence(updatesToSend);
+  return { ok: true, updates };
+});
+
+app.post("/lk/system/setback", async (request) => {
+  const enabled = toEnabled(extractBody(request).enabled);
+  const updates = await doUpdateSequence([{ override_web: enabled === "1" ? 2 : 0 }]);
+  return { ok: true, updates };
 });
 
 app.setErrorHandler((error, request, reply) => {
