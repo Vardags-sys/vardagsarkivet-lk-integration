@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: vardagsarkivet-lk-integration
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: PORT
+        value: 3000
+      - key: API_KEY
+        sync: false
+      - key: LK_BASE_URL
+        value: https://my.lk.nu
+      - key: LK_EMAIL
+        sync: false
+      - key: LK_PASSWORD
+        sync: false
+      - key: LK_LOGIN_PATH
+        value: /login
+      - key: LK_USERNAME_FIELD
+        value: email
+      - key: LK_PASSWORD_FIELD
+        value: password
+      - key: LK_THERMOSTAT_COUNT
+        value: 12
+      - key: LK_THERMOSTAT_PATH
+        value: /thermostat.json?tid={tid}
+      - key: LK_INSECURE_TLS
+        value: false

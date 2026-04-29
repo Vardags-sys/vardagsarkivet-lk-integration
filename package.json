@@ -1,0 +1,21 @@
+{
+  "name": "vardagsarkivet-lk-integration",
+  "version": "0.1.0",
+  "description": "Central LK Systems integration service for Vardagsarkivet.",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch server.js",
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "axios": "^1.7.9",
+    "axios-cookiejar-support": "^5.0.5",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.2.1",
+    "tough-cookie": "^5.0.0"
+  }
+}
