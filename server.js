@@ -16,11 +16,8 @@ const LK_LOGIN_PATH = process.env.LK_LOGIN_PATH || "/login";
 const LK_USERNAME_FIELD = process.env.LK_USERNAME_FIELD || "email";
 const LK_PASSWORD_FIELD = process.env.LK_PASSWORD_FIELD || "password";
 
-const LK_THERMOSTAT_COUNT = Number(process.env.LK_THERMOSTAT_COUNT || 12);
-const LK_THERMOSTAT_PATH =
-  process.env.LK_THERMOSTAT_PATH || "/thermostat.json?tid={tid}";
-
 const LK_INSECURE_TLS = process.env.LK_INSECURE_TLS === "true";
+const LK_LKID_COOKIE = process.env.LK_LKID_COOKIE || "";
 
 if (LK_INSECURE_TLS) {
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -57,6 +54,27 @@ app.addHook("onRequest", async (request, reply) => {
 class SimpleCookieJar {
   constructor() {
     this.cookies = new Map();
+  }
+
+  set(name, value) {
+    if (!name || value === undefined || value === null || value === "") return;
+
+    let cleanValue = String(value).trim();
+
+    // If user pasted "lkid=...; something=...", extract only value.
+    const pattern = new RegExp(`${name}=([^;]+)`);
+    const match = cleanValue.match(pattern);
+    if (match) cleanValue = match[1].trim();
+
+    // LK/Tornado cookies are quoted in the browser.
+    if (
+      ["lkid", "theemail", "user", "lasttab"].includes(name) &&
+      !cleanValue.startsWith('"')
+    ) {
+      cleanValue = `"${cleanValue}"`;
+    }
+
+    this.cookies.set(name, cleanValue);
   }
 
   addFromSetCookie(setCookieHeader) {
@@ -133,8 +151,12 @@ async function lkRequest(jar, options) {
       maxRedirects: 0,
       validateStatus: () => true,
       headers: {
-        "User-Agent": "Vardagsarkivet-LK-Integration/0.2",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         Accept: "application/json,text/html,*/*",
+        "Accept-Language": "sv,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
         ...headers,
       },
@@ -147,9 +169,7 @@ async function lkRequest(jar, options) {
       response.headers.location &&
       redirect < maxRedirects
     ) {
-      const nextUrl = new URL(response.headers.location, currentUrl).toString();
-
-      currentUrl = nextUrl;
+      currentUrl = new URL(response.headers.location, currentUrl).toString();
 
       if (response.status === 303 || currentMethod === "POST") {
         currentMethod = "GET";
@@ -179,13 +199,25 @@ function shortBody(data, limit = 1000) {
   }
 }
 
-async function loginToLk() {
+function createSeededJar() {
   const jar = new SimpleCookieJar();
 
-  // First request establishes any anonymous/session cookies.
+  jar.set("theemail", LK_EMAIL);
+  jar.set("viewport", "796x1121x1.00");
+
+  if (LK_LKID_COOKIE) {
+    jar.set("lkid", LK_LKID_COOKIE);
+  }
+
+  return jar;
+}
+
+async function loginToLk() {
+  const jar = createSeededJar();
+
   await lkRequest(jar, {
     method: "GET",
-    path: "/",
+    path: "/login?next=%2F",
   });
 
   const form = new URLSearchParams();
@@ -197,9 +229,10 @@ async function loginToLk() {
     path: LK_LOGIN_PATH,
     data: form.toString(),
     headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
       Origin: LK_BASE_URL,
-      Referer: `${LK_BASE_URL}/`,
+      Referer: `${LK_BASE_URL}/login?next=%2F`,
+      Accept: "*/*",
     },
   });
 
@@ -209,16 +242,32 @@ async function loginToLk() {
     );
   }
 
+  if (
+    response.data &&
+    typeof response.data === "object" &&
+    response.data.error &&
+    String(response.data.error) !== "0"
+  ) {
+    throw new Error(`LK login rejected: ${shortBody(response.data, 800)}`);
+  }
+
   return {
     jar,
     loginStatus: response.status,
     loginContentType: response.headers["content-type"] || null,
-    loginSample: shortBody(response.data, 500),
+    loginResponse: response.data,
   };
 }
 
-function thermostatPath(tid) {
-  return LK_THERMOSTAT_PATH.replace("{tid}", encodeURIComponent(String(tid)));
+function decodeHexLatin1(hex) {
+  if (!hex || typeof hex !== "string") return "";
+
+  try {
+    const bytes = hex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) || [];
+    return Buffer.from(bytes).toString("latin1");
+  } catch {
+    return hex;
+  }
 }
 
 function toCelsius(value) {
@@ -233,41 +282,90 @@ function toCelsius(value) {
   return n;
 }
 
-function normalizeThermostat(tid, raw) {
-  const currentTemperature =
-    toCelsius(raw.get_room_deg) ??
-    toCelsius(raw.current_temp) ??
-    toCelsius(raw.currentTemperature) ??
-    toCelsius(raw.room_temp) ??
-    toCelsius(raw.temperature) ??
-    null;
+async function getMainJson() {
+  const { jar, loginResponse } = await loginToLk();
 
-  const setpoint =
-    toCelsius(raw.set_room_deg) ??
-    toCelsius(raw.setpoint) ??
-    toCelsius(raw.target_temp) ??
-    toCelsius(raw.targetTemperature) ??
-    null;
+  const response = await lkRequest(jar, {
+    method: "GET",
+    path: `/main.json?_=${Date.now()}`,
+    headers: {
+      Accept: "*/*",
+      Referer: `${LK_BASE_URL}/`,
+    },
+  });
+
+  if (response.status >= 400) {
+    throw new Error(
+      `LK main.json failed. HTTP ${response.status}: ${shortBody(
+        response.data,
+        800
+      )}`
+    );
+  }
+
+  if (!response.data || typeof response.data !== "object") {
+    throw new Error(`LK main.json was not JSON: ${shortBody(response.data, 800)}`);
+  }
 
   return {
-    tid,
-    name:
-      raw.name ??
-      raw.room_name ??
-      raw.label ??
-      raw.description ??
-      `Thermostat ${tid}`,
-    currentTemperature,
-    setpoint,
-    battery: raw.battery !== undefined ? Number(raw.battery) : null,
-    heating:
-      raw.heat_status === true ||
-      raw.heat_status === "true" ||
-      raw.heat_status === 1 ||
-      raw.heat_status === "1" ||
-      raw.heating === true ||
-      raw.heating === "true",
-    raw,
+    raw: response.data,
+    loginResponse,
+    cookies: {
+      count: jar.count(),
+      names: jar.names(),
+    },
+  };
+}
+
+function normalizeMainJson(raw) {
+  const names = raw.name || [];
+  const sectionNames = raw.sect_name || [];
+  const active = raw.active || [];
+  const getRoomDeg = raw.get_room_deg || [];
+  const setRoomDeg = raw.set_room_deg || [];
+  const heatStatus = raw.heat_status || [];
+  const zoneAlarms = raw.zone_alarms || [];
+  const bypassStatus = raw.bypass_status || [];
+
+  const zones = [];
+
+  for (let i = 0; i < names.length; i++) {
+    const isActive = String(active[i] || "0") === "1";
+
+    if (!isActive) continue;
+
+    const zone = {
+      index: i,
+      id: i + 1,
+      name: decodeHexLatin1(names[i]),
+      currentTemperature: toCelsius(getRoomDeg[i]),
+      setpoint: toCelsius(setRoomDeg[i]),
+      heating: String(heatStatus[i] || "0") === "1",
+      alarm: String(zoneAlarms[i] || "0") !== "0",
+      bypass: String(bypassStatus[i] || "0") !== "0",
+      raw: {
+        name: names[i],
+        active: active[i],
+        get_room_deg: getRoomDeg[i],
+        set_room_deg: setRoomDeg[i],
+        heat_status: heatStatus[i],
+        zone_alarms: zoneAlarms[i],
+        bypass_status: bypassStatus[i],
+      },
+    };
+
+    zones.push(zone);
+  }
+
+  const sections = sectionNames.map((name, index) => ({
+    index,
+    id: index + 1,
+    name: decodeHexLatin1(name),
+  }));
+
+  return {
+    sections,
+    zones,
   };
 }
 
@@ -275,28 +373,7 @@ app.get("/health", async () => {
   return {
     ok: true,
     service: "vardagsarkivet-lk-integration",
-    version: "0.2",
-  };
-});
-
-app.get("/lk/debug-home", async () => {
-  const jar = new SimpleCookieJar();
-
-  const response = await lkRequest(jar, {
-    method: "GET",
-    path: "/",
-  });
-
-  return {
-    ok: true,
-    baseUrl: LK_BASE_URL,
-    status: response.status,
-    contentType: response.headers["content-type"] || null,
-    cookies: {
-      count: jar.count(),
-      names: jar.names(),
-    },
-    sample: shortBody(response.data, 2000),
+    version: "0.3-main-json",
   };
 });
 
@@ -307,11 +384,10 @@ app.get("/lk/debug-login-config", async () => {
     loginPath: LK_LOGIN_PATH,
     usernameField: LK_USERNAME_FIELD,
     passwordField: LK_PASSWORD_FIELD,
-    thermostatPath: LK_THERMOSTAT_PATH,
-    thermostatCount: LK_THERMOSTAT_COUNT,
     insecureTls: LK_INSECURE_TLS,
     emailConfigured: Boolean(LK_EMAIL),
     passwordConfigured: Boolean(LK_PASSWORD),
+    lkidCookieConfigured: Boolean(LK_LKID_COOKIE),
   };
 });
 
@@ -327,102 +403,76 @@ app.get("/lk/test-login", async () => {
       count: result.jar.count(),
       names: result.jar.names(),
     },
-    message: "Login request completed.",
-    sample: result.loginSample,
+    loginResponse: result.loginResponse,
   };
 });
 
-app.get("/lk/thermostats", async () => {
-  const { jar } = await loginToLk();
-
-  const thermostats = [];
-  const errors = [];
-
-  for (let tid = 1; tid <= LK_THERMOSTAT_COUNT; tid++) {
-    try {
-      const response = await lkRequest(jar, {
-        method: "GET",
-        path: thermostatPath(tid),
-      });
-
-      if (response.status === 404) {
-        continue;
-      }
-
-      if (response.status >= 400) {
-        errors.push({
-          tid,
-          status: response.status,
-          error: shortBody(response.data, 500),
-        });
-        continue;
-      }
-
-      if (!response.data || typeof response.data !== "object") {
-        errors.push({
-          tid,
-          status: response.status,
-          error: "Response was not JSON",
-          sample: shortBody(response.data, 500),
-        });
-        continue;
-      }
-
-      thermostats.push(normalizeThermostat(tid, response.data));
-    } catch (error) {
-      errors.push({
-        tid,
-        error: error.message,
-      });
-    }
-  }
+app.get("/lk/main", async () => {
+  const result = await getMainJson();
 
   return {
     ok: true,
-    count: thermostats.length,
-    thermostats,
-    errors,
+    cookies: result.cookies,
+    data: result.raw,
   };
 });
 
-app.get("/lk/thermostats/:tid", async (request, reply) => {
-  const tid = Number(request.params.tid);
+app.get("/lk/zones", async () => {
+  const result = await getMainJson();
+  const normalized = normalizeMainJson(result.raw);
 
-  if (!Number.isInteger(tid) || tid < 1) {
+  return {
+    ok: true,
+    ...normalized,
+  };
+});
+
+// Backwards-compatible endpoint for Base44 dashboard.
+app.get("/lk/thermostats", async () => {
+  const result = await getMainJson();
+  const normalized = normalizeMainJson(result.raw);
+
+  return {
+    ok: true,
+    count: normalized.zones.length,
+    thermostats: normalized.zones,
+    sections: normalized.sections,
+  };
+});
+
+app.get("/lk/thermostats/:id", async (request, reply) => {
+  const id = Number(request.params.id);
+
+  if (!Number.isInteger(id) || id < 1) {
     return reply.code(400).send({
       ok: false,
       error: "invalid_thermostat_id",
     });
   }
 
-  const { jar } = await loginToLk();
+  const result = await getMainJson();
+  const normalized = normalizeMainJson(result.raw);
+  const thermostat = normalized.zones.find((z) => z.id === id || z.index === id);
 
-  const response = await lkRequest(jar, {
-    method: "GET",
-    path: thermostatPath(tid),
-  });
-
-  if (response.status >= 400) {
-    return reply.code(response.status).send({
+  if (!thermostat) {
+    return reply.code(404).send({
       ok: false,
-      error: "lk_request_failed",
-      status: response.status,
-      body: shortBody(response.data, 500),
+      error: "thermostat_not_found",
     });
   }
 
   return {
     ok: true,
-    thermostat: normalizeThermostat(tid, response.data),
+    thermostat,
   };
 });
 
-app.post("/lk/thermostats/:tid/setpoint", async (request, reply) => {
+app.post("/lk/thermostats/:id/setpoint", async (request, reply) => {
   return reply.code(501).send({
     ok: false,
     error: "setpoint_not_implemented_yet",
     message:
-      "Capture the real LK write request from browser DevTools/HAR, then implement this endpoint safely.",
+      "Read support is implemented through main.json. Capture the real LK write request when pressing plus/minus to implement setpoint changes.",
   });
 });
 
