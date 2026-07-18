@@ -2251,7 +2251,33 @@ app.get(
     };
   }
 );
+async function runMultiUserZones(body) {
+  const config = normalizeRequestConfig(body);
 
+  return lkContext.run(config, async () => {
+    const result = await getMainJson();
+    const normalized = normalizeMainJson(result.raw);
+
+    return {
+      ok: true,
+      connected: true,
+      mode: "multi-user",
+      zoneCount: normalized.zones.length,
+      cacheTtlSeconds: Math.round(SESSION_TTL_MS / 1000),
+      zones: normalized.zones,
+      sections: normalized.sections,
+      system: normalized.system,
+    };
+  });
+}
+
+app.post("/integrations/lk/test", async (request) => {
+  return runMultiUserZones(extractBody(request));
+});
+
+app.post("/integrations/lk/connect", async (request) => {
+  return runMultiUserZones(extractBody(request));
+});
 app.setErrorHandler(
   (error, request, reply) => {
     request.log.error({
